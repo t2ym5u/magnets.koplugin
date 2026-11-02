@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.0.1] - 2026-11-02
+
+### Fixed
+- Hard puzzles needed one-step trial ("assume this polarity, see if it
+  breaks"), which on paper plays as guessing. No level needs it any more:
+  Hard now hides many more clues (about 15 of 32 at 8×8) and is always
+  solvable by line reasoning alone. Medium hides fewer clues (n/2) so it
+  stays between Easy and Hard.
+
 ## [1.0.0] - 2026-10-30
 
 ### Added

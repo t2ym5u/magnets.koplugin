@@ -103,15 +103,17 @@ describe("MagnetsBoard", function()
             end
         end)
 
-        it("medium and hard hide clues and need tiers 2 and 3", function()
+        -- Trial reasoning (tier 3) plays as guessing on paper: no level may
+        -- need it. Hard is harder through more hidden clues instead.
+        it("medium and hard hide clues, need line reasoning but never trial", function()
             for seed = 1, 6 do
                 local m = newBoard(8, "medium", seed)
                 assert.are.equal(2, m.tier)
                 assert.is_true(m:hiddenCount() > 0)
                 assert.are.equal("stuck", (Solver.solve(m:getProblem(), 1)))
                 local h = newBoard(8, "hard", seed)
-                assert.are.equal(3, h.tier)
-                assert.are.equal("stuck", (Solver.solve(h:getProblem(), 2)))
+                assert.are.equal("solved", (Solver.solve(h:getProblem(), 2)))
+                assert.is_true(h:hiddenCount() > m:hiddenCount())
             end
         end)
 
