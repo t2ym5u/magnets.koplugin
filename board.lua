@@ -38,7 +38,9 @@ local DIR4 = { { -1, 0 }, { 1, 0 }, { 0, -1 }, { 0, 1 } }
 
 -- Per difficulty: the solver tier the puzzle must need (see solver.lua: 1 =
 -- bounds on single lines plus "no like poles side by side", 2 = exact line
--- reasoning, 3 = one-step trial) and how many of the 4n clues may be hidden.
+-- reasoning) and how many of the 4n clues may be hidden. Tier 3 (one-step
+-- trial) is never asked for: on paper it plays as guessing, so hard is harder
+-- through more hidden clues instead.
 -- Easy shows every clue. `max_tries` caps how many clue removals are
 -- attempted, as a multiple of n: each attempt is a full solve, and at tier 3
 -- an unbounded dig cost seconds on 10x10. `full_tier` only digs candidates
@@ -47,9 +49,8 @@ local DIR4 = { { -1, 0 }, { 1, 0 }, { 0, -1 }, { 0, 1 } }
 -- dig was the worst case (1 s on 10x10 here).
 local LEVELS = {
     easy   = { tier = 1, neutral = 0.20, max_hide = function()  return 0 end, max_tries = 0 },
-    medium = { tier = 2, neutral = 0.20, max_hide = function(n) return n end, max_tries = 4 },
-    hard   = { tier = 3, neutral = 0.20, max_hide = function(n) return 3 * n end, max_tries = 1.5,
-               full_tier = true },
+    medium = { tier = 2, neutral = 0.20, max_hide = function(n) return math.floor(n / 2) end, max_tries = 4 },
+    hard   = { tier = 2, neutral = 0.20, max_hide = function(n) return 3 * n end, max_tries = 4 },
 }
 
 local MAX_ATTEMPTS = 40
