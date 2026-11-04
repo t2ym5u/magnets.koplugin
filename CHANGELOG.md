@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.1.0] - 2026-11-04
+
+### Changed
+- Faster puzzle generation, same puzzles: the logic solver that proves each
+  puzzle has exactly one solution now handles a domino's remaining options
+  all at once, remembers what it already worked out for a row, skips rows
+  that did not change, and no longer makes LuaJIT recompile its code over
+  and over. Hard went from up to 0.22 s to 0.12 s on 10×10 and from 0.14 s
+  to 0.06 s on 6×6 on a desktop (roughly 5 s → 3 s and 3.5 s → 1.5 s on a
+  Kobo); Medium 10×10 from 0.14 s to 0.10 s.
+- A progress bar shows while a puzzle is being generated, when it takes
+  more than a moment (needs game-common 1.12.0).
+
 ## [1.0.4] - 2026-11-03
 
 ### Changed

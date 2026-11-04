@@ -71,4 +71,94 @@ describe("Solver", function()
         assert.are.equal("contradiction", (Solver.solve(P, 3)))
         assert.are.equal(0, (Solver.count(P, 2)))
     end)
+
+    -- Since 1.1.0 the solver works on bit masks with memoised propagators.
+    -- Against a plain enumeration of every assignment on small random
+    -- problems: no deduction may drop an option that some solution uses,
+    -- "solved" must mean exactly one solution (the one returned),
+    -- "contradiction" none, and count() must agree. (The new solver was also
+    -- cross-checked against the 1.0.x one, same statuses, tiers and domains.)
+    it("agrees with brute force on random small problems", function()
+        local function randomProblem()
+            local nv = math.random(2, 5)
+            local P = { nvars = nv, ksize = {}, sums = {}, pairs = {} }
+            for v = 1, nv do P.ksize[v] = math.random(2, 4) end
+            local sol = {}
+            for v = 1, nv do sol[v] = math.random(P.ksize[v]) end
+            for _ = 1, math.random(1, 3) do
+                local s = { vars = {}, contrib = {}, clue = 0 }
+                for v = 1, nv do
+                    if math.random() < 0.6 then
+                        local c = {}
+                        for k = 1, P.ksize[v] do c[k] = math.random(0, 2) end
+                        s.vars[#s.vars + 1], s.contrib[#s.contrib + 1] = v, c
+                        s.clue = s.clue + c[sol[v]]
+                    end
+                end
+                if math.random() < 0.15 then s.clue = s.clue + 1 end
+                if #s.vars > 0 then P.sums[#P.sums + 1] = s end
+            end
+            if #P.sums >= 2 and math.random() < 0.5 then
+                P.groups, P.grouped = { { sums = { 1, 2 } } }, { true, true }
+            end
+            for _ = 1, math.random(0, 2) do
+                local a, b = math.random(nv), math.random(nv)
+                if a ~= b then
+                    local bad = {}
+                    for ka = 1, P.ksize[a] do
+                        for kb = 1, P.ksize[b] do
+                            if math.random() < 0.3 and not (ka == sol[a] and kb == sol[b]) then
+                                bad[ka] = bad[ka] or {}
+                                bad[ka][kb] = true
+                            end
+                        end
+                    end
+                    P.pairs[#P.pairs + 1] = { a = a, b = b, bad = bad }
+                end
+            end
+            return P
+        end
+        local function solutions(P)
+            local out, cur = {}, {}
+            local function rec(v)
+                if v > P.nvars then
+                    for _, s in ipairs(P.sums) do
+                        local t = 0
+                        for j, w in ipairs(s.vars) do t = t + s.contrib[j][cur[w]] end
+                        if t ~= s.clue then return end
+                    end
+                    for _, p in ipairs(P.pairs) do
+                        if p.bad[cur[p.a]] and p.bad[cur[p.a]][cur[p.b]] then return end
+                    end
+                    local c = {}
+                    for w = 1, P.nvars do c[w] = cur[w] end
+                    out[#out + 1] = c
+                    return
+                end
+                for k = 1, P.ksize[v] do cur[v] = k; rec(v + 1) end
+            end
+            rec(1)
+            return out
+        end
+        math.randomseed(7)
+        for _ = 1, 400 do
+            local P = randomProblem()
+            local sols = solutions(P)
+            assert.are.equal(math.min(#sols, 3), (Solver.count(P, 3)))
+            for cap = 1, 3 do
+                local st, _, S = Solver.solve(P, cap)
+                if st == "contradiction" then
+                    assert.are.equal(0, #sols)
+                else
+                    for _, sol in ipairs(sols) do
+                        for v = 1, P.nvars do assert.is_true(S.dom[v][sol[v]]) end
+                    end
+                    if st == "solved" then
+                        assert.are.equal(1, #sols)
+                        assert.are.same(sols[1], Solver.assignment(S))
+                    end
+                end
+            end
+        end
+    end)
 end)

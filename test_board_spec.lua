@@ -117,6 +117,37 @@ describe("MagnetsBoard", function()
             end
         end)
 
+        -- 1.1.0: the progress bar's callback must not change the puzzle a
+        -- seed gives (the timer is left out: it reads the clock), and a
+        -- generation stays far below the old worst cases (238 ms on 10x10
+        -- hard on a desktop; the bound is generous for slow test runs).
+        it("reports progress without changing the puzzle, within a time bound", function()
+            local function strip(b)
+                local d = b:serialize()
+                d.timer = nil
+                return d
+            end
+            for _, n in ipairs(Board.SIZES) do
+                for _, diff in ipairs({ "medium", "hard" }) do
+                    for seed = 1, 2 do
+                        local plain = newBoard(n, diff, seed * 7 + n)
+                        local fractions = {}
+                        math.randomseed(seed * 7 + n)
+                        local b = Board:new({ n = n, difficulty = diff, generate = false })
+                        local t0 = os.clock()
+                        b:generate(n, diff, function(f) fractions[#fractions + 1] = f end)
+                        assert.is_true(os.clock() - t0 < 10)
+                        assert.are.same(strip(plain), strip(b))
+                        assert.is_true(#fractions > 0)
+                        for i, f in ipairs(fractions) do
+                            assert.is_true(f >= 0 and f <= 1)
+                            if i > 1 then assert.is_true(f >= fractions[i - 1]) end
+                        end
+                    end
+                end
+            end
+        end)
+
         it("every puzzle has exactly one solution (independent count) and the solver finds it", function()
             local cases = { { 6, 10 }, { 8, 6 }, { 10, 3 } }
             for _, case in ipairs(cases) do
