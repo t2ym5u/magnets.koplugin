@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.2.0] - 2026-11-04
+
+### Changed
+- Faster puzzle generation again, same puzzles: when the generator tries
+  hiding one more clue, it no longer rebuilds and re-solves the whole
+  puzzle; it starts from what it already worked out with the clues that
+  stay shown. Line reasoning on a row's + and − counts is also quicker.
+  On a desktop, Hard 10×10 went from up to 0.10 s to 0.05 s, Medium 10×10
+  from 0.07 s to 0.03 s and Hard 6×6 from 0.05 s to 0.03 s (on a Kobo,
+  roughly 2.5 s → 1.1 s at worst, and usually well under a second).
+- Uses less memory: the game loads when you open it, not when KOReader
+  starts, so it no longer takes memory or startup time while unplayed.
+
 ## [1.1.0] - 2026-11-04
 
 ### Changed

@@ -45,6 +45,15 @@
 --                  (a group may also carry `shared`, a table in which
 --                  tier 2 keeps its per-group data for other problems with
 --                  the very same sums on that line)
+--                  (and `implied`, { [j] = true } for each of its sums that
+--                  every full assignment meeting the others meets too --
+--                  magnets' blank count; when two sums are left, tier 2
+--                  runs a faster DP on those two alone)
+--   off            optional: { [i] = true } switches sum i off, as if it
+--                  were not listed (a group with a switched-off sum is not
+--                  used either). The generators hide clues this way, on one
+--                  problem built once, instead of building a new problem
+--                  per clue they try to hide.
 -- ---------------------------------------------------------------------------
 --
 -- Inside, a domain is a bit mask (bit k-1 set = option k still possible) so
@@ -202,18 +211,21 @@ local b_min, b_max = {}, {}   -- scratch (no call re-enters boundsSum)
 local function boundsSum(s, S)
     local sm = S.m
     local vars, contrib, clue = s.vars, s.contrib, s.clue
-    local mins, maxs = s._min or sumMemo(s, "_min"), s._max or sumMemo(s, "_max")
     local nv = #vars
     local lo, hi, span = 0, 0, 0
     for i = 1, nv do
-        local x = sm[vars[i]]
-        local mn = mins[i][x]
+        local x, c = sm[vars[i]], contrib[i]
+        -- spread by mask, memoised on the contribution vector itself (a
+        -- caller may share equal vectors between sums and problems)
+        local mins = c._min
+        if not mins then mins = {}; c._min, c._max = mins, {} end
+        local mn = mins[x]
         local mx
         if mn then
-            mx = maxs[i][x]
+            mx = c._max[x]
         else
-            mn, mx = spread(contrib[i], x)
-            mins[i][x], maxs[i][x] = mn, mx
+            mn, mx = spread(c, x)
+            mins[x], c._max[x] = mn, mx
         end
         b_min[i], b_max[i] = mn, mx
         lo, hi = lo + mn, hi + mx
@@ -269,8 +281,10 @@ end
 local function revisePair(p, S, P)
     local sm = S.m
     local a, b = p.a, p.b
-    local ra, rb = p._ra, p._rb
-    if not ra then ra, rb = {}, {}; p._ra, p._rb = ra, rb end
+    -- memoised on the `bad` table (a caller may share equal ones)
+    local bad = p.bad
+    local ra, rb = bad._ra, bad._rb
+    if not ra then ra, rb = {}, {}; bad._ra, bad._rb = ra, rb end
     local na, nb = P.ksize[a], P.ksize[b]
     local xa, xb = sm[a], sm[b]
     local changed = false
@@ -507,39 +521,234 @@ local function exactGroup(g, P, S)
     return true, changed
 end
 
+-- Tier 2 on a group whose sums but two are implied (g.implied, see the
+-- header): the same exact test as exactGroup, run on those two sums A and B
+-- alone, which is equivalent as every full assignment that meets them meets
+-- the others. The DP state is a bit mask per partial sum of B (bit a set =
+-- partial sum a of A reachable), so a step is a few shifts instead of a set
+-- of packed keys.
+local function prepareGroup2(g, P)
+    if g.ya then return end
+    local sh = g.shared
+    if sh and sh.ya then
+        g.vars, g.ya, g.yb, g.ca, g.cb = sh.vars, sh.ya, sh.yb, sh.ca, sh.cb
+        return
+    end
+    local two = {}
+    for j = 1, #g.sums do
+        if not g.implied[j] then two[#two + 1] = P.sums[g.sums[j]] end
+    end
+    assert(#two == 2, "solver: implied group needs two explicit sums")
+    -- usual case: every sum of the group lists the same variables in the
+    -- same order; then the two sums' own contribution vectors serve as is
+    local same = true
+    local va = two[1].vars
+    for j = 1, #g.sums do
+        local vs = P.sums[g.sums[j]].vars
+        if #vs ~= #va then same = false; break end
+        for i = 1, #va do
+            if vs[i] ~= va[i] then same = false; break end
+        end
+        if not same then break end
+    end
+    if same then
+        g.vars, g.ya, g.yb, g.ca, g.cb = va, two[1].contrib, two[2].contrib, two[1].clue, two[2].clue
+        return
+    end
+    local vars, ya, yb, slot_of = {}, {}, {}, {}
+    for j = 1, #g.sums do   -- every variable of the line, implied sums too
+        local s = P.sums[g.sums[j]]
+        for _, v in ipairs(s.vars) do
+            if not slot_of[v] then
+                local slot = #vars + 1
+                vars[slot], slot_of[v] = v, slot
+                ya[slot], yb[slot] = {}, {}
+                for k = 1, P.ksize[v] do ya[slot][k], yb[slot][k] = 0, 0 end
+            end
+        end
+    end
+    for t, y in ipairs({ ya, yb }) do
+        local s = two[t]
+        for i, v in ipairs(s.vars) do
+            local slot, c = slot_of[v], s.contrib[i]
+            for k = 1, #c do y[slot][k] = y[slot][k] + c[k] end
+        end
+    end
+    g.vars, g.ya, g.yb, g.ca, g.cb = vars, ya, yb, two[1].clue, two[2].clue
+    if sh then
+        sh.vars, sh.ya, sh.yb, sh.ca, sh.cb = g.vars, g.ya, g.yb, g.ca, g.cb
+    end
+end
+
+-- Layers of the DP, flat: layer j, partial B sum b at [j * W + b] (scratch,
+-- exactGroup2 is never re-entered).
+local L2 = {}
+
+local function exactGroup2(g, P, S)
+    prepareGroup2(g, P)
+    local sm, size = S.m, S.size
+    local vars, ya, yb, ca, cb = g.vars, g.ya, g.yb, g.ca, g.cb
+    if ca < 0 or cb < 0 then return false, false end
+    assert(ca <= 29, "solver: clue too large")
+    local W = cb + 1
+    local limit = BIT[ca + 2] - 1
+    local open, sa, sb = {}, 0, 0
+    for i = 1, #vars do
+        local v = vars[i]
+        if size[v] == 1 then
+            local k = LOW[sm[v]]
+            sa, sb = sa + ya[i][k], sb + yb[i][k]
+        else
+            open[#open + 1] = i
+        end
+    end
+    if sa > ca or sb > cb then return false, false end
+    local nv = #open
+    -- forward: layers 0..nv; backward: layers nv+1..1 stored at nv+2..2nv+2
+    local F, BK = 0, nv + 1   -- layer offsets (in layers)
+    for b = 0, cb do L2[F * W + b] = 0 end
+    L2[F * W + sb] = BIT[sa + 1]
+    for j = 1, nv do
+        local i = open[j]
+        local x, ai, bi = sm[vars[i]], ya[i], yb[i]
+        local po, co = (F + j - 1) * W, (F + j) * W
+        for b = 0, cb do L2[co + b] = 0 end
+        for k = 1, #ai do
+            if band(x, BIT[k]) ~= 0 then
+                local da, db = ai[k], bi[k]
+                for b = 0, cb - db do
+                    local m = L2[po + b]
+                    if m ~= 0 then
+                        L2[co + b + db] = bor(L2[co + b + db], band(lshift(m, da), limit))
+                    end
+                end
+            end
+        end
+    end
+    if band(L2[(F + nv) * W + cb], BIT[ca + 1]) == 0 then return false, false end
+    -- backward layer j (vars j..nv), at offset (BK + j) * W; j = nv + 1 is
+    -- the empty sum
+    local eo = (BK + nv + 1) * W
+    for b = 0, cb do L2[eo + b] = 0 end
+    L2[eo] = 1
+    for j = nv, 1, -1 do
+        local i = open[j]
+        local x, ai, bi = sm[vars[i]], ya[i], yb[i]
+        local po, co = (BK + j + 1) * W, (BK + j) * W
+        for b = 0, cb do L2[co + b] = 0 end
+        for k = 1, #ai do
+            if band(x, BIT[k]) ~= 0 then
+                local da, db = ai[k], bi[k]
+                for b = 0, cb - db do
+                    local m = L2[po + b]
+                    if m ~= 0 then
+                        L2[co + b + db] = bor(L2[co + b + db], band(lshift(m, da), limit))
+                    end
+                end
+            end
+        end
+    end
+    local changed = false
+    for j = 1, nv do
+        local i = open[j]
+        local v = vars[i]
+        local x, ai, bi = sm[v], ya[i], yb[i]
+        local fo, bo = (F + j - 1) * W, (BK + j + 1) * W
+        local keep = x
+        for k = 1, #ai do
+            if band(x, BIT[k]) ~= 0 then
+                local na, nb = ca - ai[k], cb - bi[k]   -- left for the others
+                local ok = false
+                if na >= 0 and nb >= 0 then
+                    for b1 = 0, nb do
+                        local f, r = L2[fo + b1], L2[bo + nb - b1]
+                        if f ~= 0 and r ~= 0 then
+                            -- some a1 in f and a2 in r with a1 + a2 = na
+                            for a1 = 0, na do
+                                if band(f, BIT[a1 + 1]) ~= 0 and band(r, BIT[na - a1 + 1]) ~= 0 then
+                                    ok = true; break
+                                end
+                            end
+                            if ok then break end
+                        end
+                    end
+                end
+                if not ok then keep = keep - BIT[k] end
+            end
+        end
+        if keep ~= x then
+            if not narrow(S, v, keep) then return false, true end
+            changed = true
+        end
+    end
+    return true, changed
+end
+
 -- Constraint index, built once per problem: every tier-1 constraint (sums
 -- first, then pairs) and, per variable, the constraints it appears in.
 local function index(P)
     if P._cons then return end
+    -- cons[ci] = the sum or pair table; a pair is told apart by its `bad`
     local cons, of_var = {}, {}
     for v = 1, P.nvars do of_var[v] = {} end
-    for _, s in ipairs(P.sums) do
-        cons[#cons + 1] = { sum = s, vars = s.vars }
-        for _, v in ipairs(s.vars) do table.insert(of_var[v], #cons) end
+    local sums, nc = P.sums, 0
+    for i = 1, #sums do
+        local s = sums[i]
+        nc = nc + 1
+        cons[nc] = s
+        local vars = s.vars
+        for j = 1, #vars do
+            local list = of_var[vars[j]]
+            list[#list + 1] = nc
+        end
     end
-    for _, p in ipairs(P.pairs or {}) do
-        cons[#cons + 1] = { pair = p, vars = { p.a, p.b } }
-        table.insert(of_var[p.a], #cons)
-        table.insert(of_var[p.b], #cons)
+    local pairs_ = P.pairs or {}
+    for i = 1, #pairs_ do
+        local p = pairs_[i]
+        nc = nc + 1
+        cons[nc] = p
+        local la, lb = of_var[p.a], of_var[p.b]
+        la[#la + 1], lb[#lb + 1] = nc, nc
     end
     P._cons, P._of_var = cons, of_var
 end
 
 -- Runs tier 1 to a fixpoint with a work queue: when a constraint narrows a
 -- domain, only the constraints sharing one of its variables are revisited.
--- `seed_var`, when given, starts the queue from that variable's constraints
--- alone -- valid when the state was at a fixpoint before that variable was
--- narrowed (a trial). Returns ok.
+-- `seed_vars` (a variable, or a list of them) and `seed_cons` (a list of
+-- constraint indices), when given, start the queue from those variables'
+-- constraints and those constraints alone -- valid when the state was at a
+-- fixpoint of every other constraint before those variables were narrowed
+-- (a trial; or a state that was the fixpoint of the same problem without
+-- the `seed_cons` sums). Returns ok.
 -- (The queue lives in the q_* upvalues so that narrow() can feed it; fix1
 -- never runs inside another fix1.)
-local function fix1(P, S, seed_var)
+local function fix1(P, S, seed_vars, seed_cons)
     index(P)
     local cons, of_var = P._cons, P._of_var
     local queue, queued, tail, head = {}, {}, 0, 1
-    if seed_var then
-        local list = of_var[seed_var]
-        for i = 1, #list do
-            local ci = list[i]
+    -- A switched-off sum (P.off, see the header) is marked as queued for
+    -- good, so that it is never queued at all. Sums come first in `cons`,
+    -- so a sum's constraint index is its index in P.sums.
+    local off = P.off
+    if off then
+        for i in pairs(off) do queued[i] = true end
+    end
+    if seed_vars or seed_cons then
+        if type(seed_vars) == "number" then seed_vars = { seed_vars } end
+        for j = 1, seed_vars and #seed_vars or 0 do
+            local list = of_var[seed_vars[j]]
+            for i = 1, #list do
+                local ci = list[i]
+                if not queued[ci] then queued[ci] = true; tail = tail + 1; queue[tail] = ci end
+            end
+        end
+        for j = 1, seed_cons and #seed_cons or 0 do
+            local ci = seed_cons[j]
+            if not queued[ci] then queued[ci] = true; tail = tail + 1; queue[tail] = ci end
+        end
+    elseif off then
+        for ci = 1, #cons do
             if not queued[ci] then queued[ci] = true; tail = tail + 1; queue[tail] = ci end
         end
     else
@@ -555,7 +764,7 @@ local function fix1(P, S, seed_var)
         q_cur = ci
         local con = cons[ci]
         local ch
-        if con.sum then ok, ch = boundsSum(con.sum, S) else ok, ch = revisePair(con.pair, S, P) end
+        if con.bad then ok, ch = revisePair(con, S, P) else ok, ch = boundsSum(con, S) end
         if not ok then break end
         -- bounds pruning is not idempotent: run this one again too
         if ch and not queued[ci] then
@@ -584,12 +793,28 @@ end
 local function sweep2(P, S)
     stamped(S, P.nvars)
     local changed = false
-    local grouped = P.grouped or {}
+    local grouped, off = P.grouped or {}, P.off
+    -- A group with a switched-off sum is not used: its other sums then
+    -- run one by one, as if they had never been grouped.
+    local alone
     if P.groups then
         for _, g in ipairs(P.groups) do
-            prepareGroup(g, P)
-            if moved(S, g, g.vars) then
-                local ok, ch = exactGroup(g, P, S)
+            local active = true
+            if off then
+                for _, i in ipairs(g.sums) do
+                    if off[i] then active = false; break end
+                end
+            end
+            if not active then
+                alone = alone or {}
+                for _, i in ipairs(g.sums) do alone[i] = true end
+            end
+            if active then
+                if g.implied then prepareGroup2(g, P) else prepareGroup(g, P) end
+            end
+            if active and moved(S, g, g.vars) then
+                local ok, ch
+                if g.implied then ok, ch = exactGroup2(g, P, S) else ok, ch = exactGroup(g, P, S) end
                 if not ok then return false, true end
                 if ch then changed = true end
                 S.ran[g] = S.tick
@@ -597,7 +822,7 @@ local function sweep2(P, S)
         end
     end
     for i = 1, #P.sums do
-        if not grouped[i] then
+        if not (off and off[i]) and (not grouped[i] or (alone and alone[i])) then
             local s = P.sums[i]
             if moved(S, s, s.vars) then
                 local ok, ch = exactSum(s, S)
@@ -616,7 +841,8 @@ end
 -- generation went into the compiler (measured: twice as fast without).
 -- Tier 1 compiles fine and stays compiled.
 if jit then
-    for _, f in ipairs({ exactSum, exactGroup, groupStep, distinct, prepareGroup, validKeys, sweep2 }) do
+    for _, f in ipairs({ exactSum, exactGroup, groupStep, distinct, prepareGroup, validKeys, sweep2,
+                         exactGroup2, prepareGroup2 }) do
         jit.off(f)
     end
 end
@@ -686,6 +912,130 @@ function Solver.solve(P, cap, S)
         end
         if not progressed then return "stuck", tier, toPublic(S, P) end
     end
+end
+
+-- Incremental solving, for a caller that solves many variants of one
+-- problem: the generators' dig, which hides clues one at a time (the same
+-- sums with some switched off, P.off). Every propagator only ever removes
+-- options and is monotone -- narrower domains, or more sums, never let an
+-- option back in -- so running tiers 1 and 2 to a fixpoint reaches the
+-- same state from ANY start that still holds that fixpoint, for instance
+-- the fixpoint of the same problem with more sums switched off. A "base"
+-- keeps those fixpoints for one such problem Q; Solver.trial() then solves
+-- any P that has every sum of Q, starting from them and only revisiting
+-- what P adds or what changes: the same status and tier as Solver.solve(P,
+-- cap) (cap 1 or 2), at a fraction of the cost.
+
+-- The tier-2 units sweep2 runs for P with sums `off` switched off (active
+-- groups, sums run alone), as a set.
+local function unitSet(P, off)
+    local units, grouped = {}, P.grouped or {}
+    local alone = {}
+    for _, g in ipairs(P.groups or {}) do
+        local active = true
+        if off then
+            for _, i in ipairs(g.sums) do
+                if off[i] then active = false; break end
+            end
+        end
+        if active then
+            units[g] = true
+        else
+            for _, i in ipairs(g.sums) do alone[i] = true end
+        end
+    end
+    for i, s in ipairs(P.sums) do
+        if not (off and off[i]) and (not grouped[i] or alone[i]) then units[s] = true end
+    end
+    return units
+end
+
+local function copySet(t)
+    local out = {}
+    for k in pairs(t or {}) do out[k] = true end
+    return out
+end
+
+-- P's tier-1 fixpoint, from the base's: only the sums P adds are queued.
+local function tier1From(P, base)
+    local T = copyState(base.s1, P.nvars)
+    local extra, off = {}, P.off
+    for i in pairs(base.off) do
+        if not (off and off[i]) then extra[#extra + 1] = i end
+    end
+    table.sort(extra)   -- (pairs() order is not fixed; keep runs repeatable)
+    return fix1(P, T, nil, extra), T
+end
+
+-- Narrows T, P's tier-1 fixpoint, to P's tier-1-and-2 fixpoint, starting
+-- from the base's: a tier-2 unit the base also had is skipped while none
+-- of its variables moved from the base's fixpoint (it is a fixpoint of
+-- that unit). Returns ok.
+local function tier12From(P, base, T)
+    local s12, nvars = base.s12, P.nvars
+    local tm, ts, bm = T.m, T.size, s12.m
+    local changed = {}
+    for v = 1, nvars do
+        local x = band(tm[v], bm[v])
+        if x ~= tm[v] then
+            if x == 0 then return false end
+            tm[v], ts[v] = x, POP[x]
+            changed[#changed + 1] = v
+        end
+    end
+    if #changed > 0 and not fix1(P, T, changed) then return false end
+    local vt, ran = {}, {}
+    for v = 1, nvars do vt[v] = (tm[v] ~= bm[v]) and 1 or 0 end
+    if not base.units then base.units = unitSet(P, base.off) end
+    for u in pairs(base.units) do ran[u] = 0 end
+    T.vt, T.tick, T.ran = vt, 1, ran
+    while true do
+        local t0 = T.tick
+        local ok, ch = sweep2(P, T)
+        if not ok then return false end
+        if not ch then return true end
+        changed = {}
+        for v = 1, nvars do
+            if vt[v] > t0 then changed[#changed + 1] = v end
+        end
+        if not fix1(P, T, changed) then return false end
+    end
+end
+
+-- A base for problem P (its current P.off), solved from scratch up to
+-- `cap` (1 or 2).
+function Solver.newBase(P, cap)
+    local S1 = fullState(P)
+    fix1(P, S1)
+    local S12
+    if cap >= 2 then
+        S12 = copyState(S1, P.nvars)
+        fix12(P, S12)
+    end
+    -- (units: the base's tier-2 units, made when first needed)
+    return { off = copySet(P.off), s1 = S1, s12 = S12, cap = cap }
+end
+
+-- Solves P, which must have every sum of the base's problem (P.off a
+-- subset of its off). Returns status, tier, like Solver.solve(P, base.cap).
+function Solver.trial(P, base)
+    local ok, T = tier1From(P, base)
+    if not ok then return "contradiction", 1 end
+    if isSolved(P, T) then return "solved", 1 end
+    if base.cap < 2 then return "stuck", 1 end
+    if not tier12From(P, base, T) then return "contradiction", 2 end
+    return isSolved(P, T) and "solved" or "stuck", 2
+end
+
+-- Moves the base on to P, which has every sum of the base's problem.
+function Solver.extendBase(P, base)
+    local _, T = tier1From(P, base)
+    local T12
+    if base.cap >= 2 then
+        T12 = copyState(T, P.nvars)
+        tier12From(P, base, T12)
+    end
+    base.s1, base.s12, base.off, base.units = T, T12, copySet(P.off), nil
 end
 
 -- The option chosen for each variable in a solved state.
