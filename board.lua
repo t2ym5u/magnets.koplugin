@@ -151,7 +151,11 @@ end
 -- false = hidden.
 local CLUE_KINDS = { "row_plus", "row_minus", "col_plus", "col_minus" }
 
-local function buildProblem(n, dominoes, pairs_, clues)
+-- `cache` (optional, one per tiling) keeps the sum tables and the solver's
+-- per-line group data between the many problems a dig builds: they only
+-- depend on the tiling and the clue values, and the solver never writes
+-- to a sum.
+local function buildProblem(n, dominoes, pairs_, clues, cache)
     local P = { nvars = #dominoes, ksize = {}, sums = {}, pairs = pairs_ }
     for d = 1, #dominoes do P.ksize[d] = 3 end
     for _, kind in ipairs(CLUE_KINDS) do
@@ -159,7 +163,10 @@ local function buildProblem(n, dominoes, pairs_, clues)
         local want    = kind:sub(-4) == "plus" and C_PLUS or C_MINUS
         for line = 1, n do
             local clue = clues[kind][line]
-            if clue then
+            local ckey = cache and (kind .. line .. ":" .. tostring(clue))
+            if clue and cache and cache[ckey] then
+                P.sums[#P.sums + 1] = cache[ckey]
+            elseif clue then
                 local s = { clue = clue, vars = {}, contrib = {},
                             line_key = (is_row and "r" or "c") .. line }
                 for d, dm in ipairs(dominoes) do
@@ -177,6 +184,7 @@ local function buildProblem(n, dominoes, pairs_, clues)
                     end
                 end
                 P.sums[#P.sums + 1] = s
+                if cache then cache[ckey] = s end
             end
         end
     end
@@ -197,15 +205,20 @@ local function buildProblem(n, dominoes, pairs_, clues)
         for line = 1, n do
             local p, m = clues[pk][line], clues[mk][line]
             local key = (is_row and "r" or "c") .. line
+            local bkey = cache and ("b" .. key .. ":" .. tostring(p) .. ":" .. tostring(m))
             if p and m then
-                local s = { clue = n - p - m, vars = {}, contrib = {} }
-                for d, dm in ipairs(dominoes) do
-                    local k = 0
-                    if (is_row and dm[1] or dm[2]) == line then k = k + 1 end
-                    if (is_row and dm[3] or dm[4]) == line then k = k + 1 end
-                    if k > 0 then
-                        s.vars[#s.vars + 1], s.contrib[#s.contrib + 1] = d, { k, 0, 0 }
+                local s = cache and cache[bkey]
+                if not s then
+                    s = { clue = n - p - m, vars = {}, contrib = {} }
+                    for d, dm in ipairs(dominoes) do
+                        local k = 0
+                        if (is_row and dm[1] or dm[2]) == line then k = k + 1 end
+                        if (is_row and dm[3] or dm[4]) == line then k = k + 1 end
+                        if k > 0 then
+                            s.vars[#s.vars + 1], s.contrib[#s.contrib + 1] = d, { k, 0, 0 }
+                        end
                     end
+                    if cache then cache[bkey] = s end
                 end
                 P.sums[#P.sums + 1] = s
                 line_sums[key] = line_sums[key] or {}
@@ -213,7 +226,13 @@ local function buildProblem(n, dominoes, pairs_, clues)
             end
             local group = line_sums[key]
             if group and #group > 1 then
-                P.groups[#P.groups + 1] = { sums = group }
+                local shared
+                if cache then
+                    local gkey = "g" .. bkey
+                    shared = cache[gkey] or {}
+                    cache[gkey] = shared
+                end
+                P.groups[#P.groups + 1] = { sums = group, shared = shared }
                 for _, i in ipairs(group) do P.grouped[i] = true end
             end
         end
@@ -297,7 +316,7 @@ local function copyClues(clues)
 end
 
 -- Hides clues (random order) while the puzzle stays solvable within `cap`.
-local function digClues(n, dominoes, pairs_, clues, cap, max_hide, max_tries, tier)
+local function digClues(n, dominoes, pairs_, clues, cap, max_hide, max_tries, tier, cache, on_try)
     local order = {}
     for kind = 1, 4 do
         for line = 1, n do order[#order + 1] = { CLUE_KINDS[kind], line } end
@@ -308,7 +327,8 @@ local function digClues(n, dominoes, pairs_, clues, cap, max_hide, max_tries, ti
         if hidden >= max_hide or t > max_tries then break end
         local trial = copyClues(clues)
         trial[o[1]][o[2]] = false
-        local st, t2 = Solver.solve(buildProblem(n, dominoes, pairs_, trial), cap)
+        if on_try then on_try() end
+        local st, t2 = Solver.solve(buildProblem(n, dominoes, pairs_, trial, cache), cap)
         if st == "solved" then
             clues, tier, hidden = trial, t2, hidden + 1
         end
@@ -319,18 +339,30 @@ end
 -- One complete puzzle. The solver must deduce every domino (which proves the
 -- solution unique); the first candidate whose hardest step equals the level's
 -- tier wins, otherwise the hardest seen is kept.
-local function generatePuzzle(n, difficulty)
+-- `on_progress(fraction)`, optional, is called before every solve. The work
+-- has no fixed size (a level may take one candidate or many), so the
+-- fraction approaches 1 as solves pile up, against the typical count of one
+-- candidate dug to the end.
+local function generatePuzzle(n, difficulty, on_progress)
     local lv = LEVELS[difficulty] or LEVELS[DEFAULT_DIFF]
+    local max_tries = math.floor(lv.max_tries * n)
+    local solves, typical = 0, 1 + max_tries
+    local function tick()
+        solves = solves + 1
+        if on_progress then on_progress(solves / (solves + typical)) end
+    end
     local best
     for _ = 1, MAX_ATTEMPTS do
         local dom_id, dominoes = makeTiling(n)
         local pairs_ = buildPairs(n, dom_id, dominoes)
         local sol    = assignPolarity(n, dom_id, dominoes, lv.neutral)
         local clues  = fullClues(n, dominoes, sol)
-        local st, tier = Solver.solve(buildProblem(n, dominoes, pairs_, clues), lv.tier)
+        local cache  = {}
+        tick()
+        local st, tier = Solver.solve(buildProblem(n, dominoes, pairs_, clues, cache), lv.tier)
         if st == "solved" and (tier == lv.tier or not lv.full_tier) then
             clues, tier = digClues(n, dominoes, pairs_, clues, lv.tier, lv.max_hide(n),
-                math.floor(lv.max_tries * n), tier)
+                max_tries, tier, cache, tick)
             if not best or tier > best.tier then
                 best = { dom_id = dom_id, dominoes = dominoes, solution = sol, clues = clues, tier = tier }
             end
@@ -360,14 +392,15 @@ function MagnetsBoard:new(opts)
     return obj
 end
 
-function MagnetsBoard:generate(n, difficulty)
+-- `on_progress(fraction)`: optional, for the screen's progress bar.
+function MagnetsBoard:generate(n, difficulty, on_progress)
     self.n          = n or self.n
     self.difficulty = difficulty or self.difficulty
     -- No puzzle can come back nil: every attempt with all clues shown is at
     -- worst "stuck", and 40 stuck attempts in a row have not been observed;
     -- loop anyway rather than hand the screen a nil.
     local p
-    repeat p = generatePuzzle(self.n, self.difficulty) until p
+    repeat p = generatePuzzle(self.n, self.difficulty, on_progress) until p
     self.dom_id   = p.dom_id
     self.dominoes = p.dominoes
     self.solution = p.solution
