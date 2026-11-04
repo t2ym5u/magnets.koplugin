@@ -148,6 +148,35 @@ describe("MagnetsBoard", function()
             end
         end)
 
+        -- 1.2.0 made generation faster without changing what a seed gives:
+        -- these are 1.1.0's clues (math.random differs between LuaJIT and
+        -- PUC Lua, hence two sets).
+        it("gives the same puzzles per seed as 1.1.0", function()
+            local expected = jit and {
+                "2.22.2 3.3.2. 232.3. ..12..",
+                "3434.22. 43432.32 3443133. 34422243",
+                "3..4.4...5 .....4.535 5..45434.5 .455...4.5",
+            } or {
+                ".1.... .3...1 .....1 33221.",
+                "3332.424 4223423. 44212.43 4.213333",
+                "4.3534.... ..534.344. 5..13..4.. 555.14.44.",
+            }
+            local function key(b)
+                local out = {}
+                for _, k in ipairs({ "row_plus", "row_minus", "col_plus", "col_minus" }) do
+                    local t = {}
+                    for i = 1, b.n do
+                        t[i] = b.clues[k][i] == false and "." or tostring(b.clues[k][i])
+                    end
+                    out[#out + 1] = table.concat(t)
+                end
+                return table.concat(out, " ")
+            end
+            for i, c in ipairs({ { 6, "hard", 3 }, { 8, "medium", 5 }, { 10, "hard", 2 } }) do
+                assert.are.equal(expected[i], key(newBoard(c[1], c[2], c[3])))
+            end
+        end)
+
         it("every puzzle has exactly one solution (independent count) and the solver finds it", function()
             local cases = { { 6, 10 }, { 8, 6 }, { 10, 3 } }
             for _, case in ipairs(cases) do

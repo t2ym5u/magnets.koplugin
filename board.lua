@@ -65,28 +65,26 @@ local MAX_ATTEMPTS = 40
 -- the first cell top or left.
 local function makeTiling(n)
     local id = emptyGrid(n, n, 0)
-    local mate = {}   -- mate[r][c] = { r, c } of the other half
+    -- mate[i] = the other half of cell i, cells numbered (r - 1) * n + c
+    local mate = {}
     for r = 1, n do
-        mate[r] = {}
         for c = 1, n, 2 do
-            mate[r][c], mate[r][c + 1] = { r, c + 1 }, { r, c }
+            local i = (r - 1) * n + c
+            mate[i], mate[i + 1] = i + 1, i
         end
-    end
-    local function pairUp(r1, c1, r2, c2)
-        mate[r1][c1], mate[r2][c2] = { r2, c2 }, { r1, c1 }
     end
     for _ = 1, n * n * 12 do
         local r, c = math.random(n - 1), math.random(n - 1)
-        local m = mate[r][c]
-        if m[1] == r and m[2] == c + 1 then
-            local m2 = mate[r + 1][c]
-            if m2[1] == r + 1 and m2[2] == c + 1 then   -- two horizontals -> verticals
-                pairUp(r, c, r + 1, c); pairUp(r, c + 1, r + 1, c + 1)
+        local i = (r - 1) * n + c
+        local m = mate[i]
+        if m == i + 1 then
+            local j = i + n
+            if mate[j] == j + 1 then   -- two horizontals -> verticals
+                mate[i], mate[j], mate[i + 1], mate[j + 1] = j, i, j + 1, i + 1
             end
-        elseif m[1] == r + 1 and m[2] == c then
-            local m2 = mate[r][c + 1]
-            if m2[1] == r + 1 and m2[2] == c + 1 then   -- two verticals -> horizontals
-                pairUp(r, c, r, c + 1); pairUp(r + 1, c, r + 1, c + 1)
+        elseif m == i + n then
+            if mate[i + 1] == i + 1 + n then   -- two verticals -> horizontals
+                mate[i], mate[i + 1], mate[i + n], mate[i + n + 1] = i + 1, i, i + n + 1, i + n
             end
         end
     end
@@ -94,9 +92,10 @@ local function makeTiling(n)
     for r = 1, n do
         for c = 1, n do
             if id[r][c] == 0 then
-                local m = mate[r][c]
-                dominoes[#dominoes + 1] = { r, c, m[1], m[2] }
-                id[r][c], id[m[1]][m[2]] = #dominoes, #dominoes
+                local m = mate[(r - 1) * n + c] - 1
+                local r2, c2 = math.floor(m / n) + 1, m % n + 1
+                dominoes[#dominoes + 1] = { r, c, r2, c2 }
+                id[r][c], id[r2][c2] = #dominoes, #dominoes
             end
         end
     end
@@ -109,6 +108,21 @@ local function cellSign(k, which)
     if k == D_MINUS then return which == 1 and C_MINUS or C_PLUS end
     if k == D_NEUTRAL then return C_NEUTRAL end
     return C_EMPTY
+end
+
+-- Tables the solver memoises on, shared between candidate grids whenever
+-- they are equal: forbidden-pair tables (by pattern), contribution vectors
+-- (by value) and, per (pole, halves on the line), a line's vector.
+local SHARED_BAD, SHARED_CONTRIB, LINE_CONTRIB = {}, {}, {}
+
+local function sharedContrib(a, b, c)
+    local key = a * 100 + b * 10 + c
+    local v = SHARED_CONTRIB[key]
+    if not v then
+        v = { a, b, c }
+        SHARED_CONTRIB[key] = v
+    end
+    return v
 end
 
 -- Forbidden option pairs between neighbouring dominoes: like poles may not
@@ -144,6 +158,18 @@ local function buildPairs(n, dom_id, dominoes)
             end
         end
     end
+    -- Equal tables are shared (the solver memoises on them, so its work
+    -- carries over from one candidate grid to the next).
+    for _, p in ipairs(list) do
+        local key = 0
+        for ka = 2, 3 do
+            for kb = 2, 3 do
+                key = key * 2 + ((p.bad[ka] and p.bad[ka][kb]) and 1 or 0)
+            end
+        end
+        if not SHARED_BAD[key] then SHARED_BAD[key] = p.bad end
+        p.bad = SHARED_BAD[key]
+    end
     return list
 end
 
@@ -151,40 +177,57 @@ end
 -- false = hidden.
 local CLUE_KINDS = { "row_plus", "row_minus", "col_plus", "col_minus" }
 
--- `cache` (optional, one per tiling) keeps the sum tables and the solver's
--- per-line group data between the many problems a dig builds: they only
--- depend on the tiling and the clue values, and the solver never writes
--- to a sum.
-local function buildProblem(n, dominoes, pairs_, clues, cache)
-    local P = { nvars = #dominoes, ksize = {}, sums = {}, pairs = pairs_ }
-    for d = 1, #dominoes do P.ksize[d] = 3 end
+-- The generator builds one problem per candidate grid, with every clue,
+-- and hides clues by switching their sums off (P.off): `sum_of[kind][line]`
+-- and `blank_of[line key]` give the sums' indices.
+local function buildProblem(n, dominoes, clues)
+    local P = { nvars = #dominoes, ksize = {}, sums = {}, pairs = nil,
+                sum_of = {}, blank_of = {} }
+    -- the dominoes on each line, ascending (dom), and which of their
+    -- halves lie on it (half: 1 or 2, 0 = both)
+    local dom, half = { r = {}, c = {} }, { r = {}, c = {} }
+    for line = 1, n do
+        dom.r[line], dom.c[line], half.r[line], half.c[line] = {}, {}, {}, {}
+    end
+    local function add(axis, line, d, h)
+        local list = dom[axis][line]
+        list[#list + 1] = d
+        half[axis][line][#list] = h
+    end
+    for d = 1, #dominoes do
+        P.ksize[d] = 3
+        local dm = dominoes[d]
+        if dm[1] == dm[3] then add("r", dm[1], d, 0) else add("r", dm[1], d, 1); add("r", dm[3], d, 2) end
+        if dm[2] == dm[4] then add("c", dm[2], d, 0) else add("c", dm[2], d, 1); add("c", dm[4], d, 2) end
+    end
     for _, kind in ipairs(CLUE_KINDS) do
         local is_row  = kind:sub(1, 3) == "row"
         local want    = kind:sub(-4) == "plus" and C_PLUS or C_MINUS
+        P.sum_of[kind] = {}
         for line = 1, n do
             local clue = clues[kind][line]
-            local ckey = cache and (kind .. line .. ":" .. tostring(clue))
-            if clue and cache and cache[ckey] then
-                P.sums[#P.sums + 1] = cache[ckey]
-            elseif clue then
-                local s = { clue = clue, vars = {}, contrib = {},
-                            line_key = (is_row and "r" or "c") .. line }
-                for d, dm in ipairs(dominoes) do
-                    local in1 = (is_row and dm[1] or dm[2]) == line
-                    local in2 = (is_row and dm[3] or dm[4]) == line
-                    if in1 or in2 then
-                        local cc = {}
+            if clue then
+                local s = { clue = clue, vars = {}, contrib = {} }
+                local axis = is_row and "r" or "c"
+                local ds, hs = dom[axis][line], half[axis][line]
+                for j = 1, #ds do
+                    local h = hs[j]
+                    local key = want * 3 + h
+                    local cc = LINE_CONTRIB[key]
+                    if not cc then
+                        local x = {}
                         for k = 1, 3 do
-                            local x = 0
-                            if in1 and cellSign(k, 1) == want then x = x + 1 end
-                            if in2 and cellSign(k, 2) == want then x = x + 1 end
-                            cc[k] = x
+                            x[k] = 0
+                            if h ~= 2 and cellSign(k, 1) == want then x[k] = x[k] + 1 end
+                            if h ~= 1 and cellSign(k, 2) == want then x[k] = x[k] + 1 end
                         end
-                        s.vars[#s.vars + 1], s.contrib[#s.contrib + 1] = d, cc
+                        cc = sharedContrib(x[1], x[2], x[3])
+                        LINE_CONTRIB[key] = cc
                     end
+                    s.vars[j], s.contrib[j] = ds[j], cc
                 end
                 P.sums[#P.sums + 1] = s
-                if cache then cache[ckey] = s end
+                P.sum_of[kind][line] = #P.sums
             end
         end
     end
@@ -194,45 +237,25 @@ local function buildProblem(n, dominoes, pairs_, clues, cache)
     -- into tier 1). Then all of a line's sums form one group, which tier 2
     -- solves jointly.
     P.groups, P.grouped = {}, {}
-    local line_sums = {}
-    for i, s in ipairs(P.sums) do
-        local key = s.line_key
-        line_sums[key] = line_sums[key] or {}
-        table.insert(line_sums[key], i)
-    end
     for _, is_row in ipairs({ true, false }) do
         local pk, mk = is_row and "row_plus" or "col_plus", is_row and "row_minus" or "col_minus"
         for line = 1, n do
             local p, m = clues[pk][line], clues[mk][line]
-            local key = (is_row and "r" or "c") .. line
-            local bkey = cache and ("b" .. key .. ":" .. tostring(p) .. ":" .. tostring(m))
             if p and m then
-                local s = cache and cache[bkey]
-                if not s then
-                    s = { clue = n - p - m, vars = {}, contrib = {} }
-                    for d, dm in ipairs(dominoes) do
-                        local k = 0
-                        if (is_row and dm[1] or dm[2]) == line then k = k + 1 end
-                        if (is_row and dm[3] or dm[4]) == line then k = k + 1 end
-                        if k > 0 then
-                            s.vars[#s.vars + 1], s.contrib[#s.contrib + 1] = d, { k, 0, 0 }
-                        end
-                    end
-                    if cache then cache[bkey] = s end
+                local s = { clue = n - p - m, vars = {}, contrib = {} }
+                local axis = is_row and "r" or "c"
+                local ds, hs = dom[axis][line], half[axis][line]
+                for j = 1, #ds do
+                    s.vars[j], s.contrib[j] = ds[j], sharedContrib(hs[j] == 0 and 2 or 1, 0, 0)
                 end
                 P.sums[#P.sums + 1] = s
-                line_sums[key] = line_sums[key] or {}
-                table.insert(line_sums[key], #P.sums)
-            end
-            local group = line_sums[key]
-            if group and #group > 1 then
-                local shared
-                if cache then
-                    local gkey = "g" .. bkey
-                    shared = cache[gkey] or {}
-                    cache[gkey] = shared
-                end
-                P.groups[#P.groups + 1] = { sums = group, shared = shared }
+                local key = (is_row and "r" or "c") .. line
+                P.blank_of[key] = #P.sums
+                local group = { P.sum_of[pk][line], P.sum_of[mk][line], #P.sums }
+                -- The blank count is implied by the other two (every domino
+                -- puts as many cells on the line whatever its option), so
+                -- tier 2 only has to meet those two jointly.
+                P.groups[#P.groups + 1] = { sums = group, implied = { [3] = true } }
                 for _, i in ipairs(group) do P.grouped[i] = true end
             end
         end
@@ -316,24 +339,60 @@ local function copyClues(clues)
 end
 
 -- Hides clues (random order) while the puzzle stays solvable within `cap`.
-local function digClues(n, dominoes, pairs_, clues, cap, max_hide, max_tries, tier, cache, on_try)
+-- `P` is the problem with every clue shown; a try switches the hidden
+-- clues' sums off (P.off) instead of building a new problem, and is solved
+-- incrementally (Solver.trial) from the clues that stay shown whatever
+-- happens next -- those never tried, or tried and kept -- with the same
+-- result as a solve from scratch.
+local function digClues(n, P, clues, cap, max_hide, max_tries, tier, on_try)
     local order = {}
     for kind = 1, 4 do
         for line = 1, n do order[#order + 1] = { CLUE_KINDS[kind], line } end
     end
     shuffle(order)
-    local hidden = 0
-    for t, o in ipairs(order) do
-        if hidden >= max_hide or t > max_tries then break end
-        local trial = copyClues(clues)
-        trial[o[1]][o[2]] = false
+    local last = math.min(#order, max_tries)
+    if max_hide <= 0 or last < 1 then return clues, tier end
+    -- the sums a clue switches off: its own and its line's blank count
+    local sums_of = {}
+    for t = 1, last do
+        local o = order[t]
+        local list = { P.sum_of[o[1]][o[2]] }
+        list[2] = P.blank_of[(o[1]:sub(1, 3) == "row" and "r" or "c") .. o[2]]
+        sums_of[t] = list
+    end
+    local hidden, hidden_off = {}, {}
+    local function offWith(from, extra)   -- hidden + order[from..last] + extra
+        local off = {}
+        for i in pairs(hidden_off) do off[i] = true end
+        for t = from, last do
+            for _, i in ipairs(sums_of[t]) do off[i] = true end
+        end
+        if extra then
+            for _, i in ipairs(sums_of[extra]) do off[i] = true end
+        end
+        return off
+    end
+    P.off = offWith(1)
+    local base = Solver.newBase(P, cap)
+    for t = 1, last do
+        if #hidden >= max_hide then break end
         if on_try then on_try() end
-        local st, t2 = Solver.solve(buildProblem(n, dominoes, pairs_, trial, cache), cap)
+        P.off = offWith(last + 1, t)   -- this try: the hidden clues and order[t]
+        local st, t2 = Solver.trial(P, base)
         if st == "solved" then
-            clues, tier, hidden = trial, t2, hidden + 1
+            hidden[#hidden + 1] = order[t]
+            for _, i in ipairs(sums_of[t]) do hidden_off[i] = true end
+            tier = t2
+        elseif t < last then
+            -- order[t] stays shown: the base gains it
+            P.off = offWith(t + 1)
+            Solver.extendBase(P, base)
         end
     end
-    return clues, tier
+    P.off = nil
+    local out = copyClues(clues)
+    for _, o in ipairs(hidden) do out[o[1]][o[2]] = false end
+    return out, tier
 end
 
 -- One complete puzzle. The solver must deduce every domino (which proves the
@@ -357,12 +416,12 @@ local function generatePuzzle(n, difficulty, on_progress)
         local pairs_ = buildPairs(n, dom_id, dominoes)
         local sol    = assignPolarity(n, dom_id, dominoes, lv.neutral)
         local clues  = fullClues(n, dominoes, sol)
-        local cache  = {}
+        local P      = buildProblem(n, dominoes, clues)
+        P.pairs      = pairs_
         tick()
-        local st, tier = Solver.solve(buildProblem(n, dominoes, pairs_, clues, cache), lv.tier)
+        local st, tier = Solver.solve(P, lv.tier)
         if st == "solved" and (tier == lv.tier or not lv.full_tier) then
-            clues, tier = digClues(n, dominoes, pairs_, clues, lv.tier, lv.max_hide(n),
-                max_tries, tier, cache, tick)
+            clues, tier = digClues(n, P, clues, lv.tier, lv.max_hide(n), max_tries, tier, tick)
             if not best or tier > best.tier then
                 best = { dom_id = dom_id, dominoes = dominoes, solution = sol, clues = clues, tier = tier }
             end
@@ -422,7 +481,9 @@ function MagnetsBoard:_reset()
 end
 
 function MagnetsBoard:getProblem()
-    return buildProblem(self.n, self.dominoes, buildPairs(self.n, self.dom_id, self.dominoes), self.clues)
+    local P = buildProblem(self.n, self.dominoes, self.clues)
+    P.pairs = buildPairs(self.n, self.dom_id, self.dominoes)
+    return P
 end
 
 -- Which half of its domino a cell is: 1 (top/left) or 2.

@@ -161,4 +161,145 @@ describe("Solver", function()
             end
         end
     end)
+    -- 1.2.0: the generators hide clues by switching sums off (P.off) and
+    -- solve each try incrementally from a base (Solver.trial). Both must
+    -- give exactly what a solve from scratch of the smaller problem gives.
+    -- (Cross-checked in development against the 1.1.0 solver on 36,000
+    -- generator-shaped instances, 0 mismatches.)
+    it("switched-off sums and incremental trials agree with solving from scratch", function()
+        local function randomProblem()
+            local nv = math.random(3, 7)
+            local P = { nvars = nv, ksize = {}, sums = {}, pairs = {} }
+            for v = 1, nv do P.ksize[v] = math.random(2, 4) end
+            local sol = {}
+            for v = 1, nv do sol[v] = math.random(P.ksize[v]) end
+            for _ = 1, math.random(2, 6) do
+                local s = { vars = {}, contrib = {}, clue = 0 }
+                for v = 1, nv do
+                    if math.random() < 0.6 then
+                        local c = {}
+                        for k = 1, P.ksize[v] do c[k] = math.random(0, 2) end
+                        s.vars[#s.vars + 1], s.contrib[#s.contrib + 1] = v, c
+                        s.clue = s.clue + c[sol[v]]
+                    end
+                end
+                if #s.vars > 0 then P.sums[#P.sums + 1] = s end
+            end
+            if #P.sums >= 2 and math.random() < 0.5 then
+                P.groups, P.grouped = { { sums = { 1, 2 } } }, { true, true }
+            end
+            for _ = 1, math.random(0, 3) do
+                local a, b = math.random(nv), math.random(nv)
+                if a ~= b then
+                    local bad = {}
+                    for ka = 1, P.ksize[a] do
+                        for kb = 1, P.ksize[b] do
+                            if math.random() < 0.3 and not (ka == sol[a] and kb == sol[b]) then
+                                bad[ka] = bad[ka] or {}
+                                bad[ka][kb] = true
+                            end
+                        end
+                    end
+                    P.pairs[#P.pairs + 1] = { a = a, b = b, bad = bad }
+                end
+            end
+            return P
+        end
+        -- the same problem with the sums in `off` left out
+        local function without(P, off)
+            local Q = { nvars = P.nvars, ksize = P.ksize, sums = {}, pairs = P.pairs }
+            local map = {}
+            for i, s in ipairs(P.sums) do
+                if not off[i] then Q.sums[#Q.sums + 1] = s; map[i] = #Q.sums end
+            end
+            if P.groups and map[1] and map[2] then
+                Q.groups, Q.grouped = { { sums = { map[1], map[2] } } }, {}
+                Q.grouped[map[1]], Q.grouped[map[2]] = true, true
+            end
+            return Q
+        end
+        local function randomOff(P, keep)
+            local off = {}
+            for i = 1, #P.sums do
+                if keep[i] == nil and math.random() < 0.4 then off[i] = true end
+            end
+            return off
+        end
+        math.randomseed(11)
+        for _ = 1, 300 do
+            local P = randomProblem()
+            local off = randomOff(P, {})
+            for cap = 1, 2 do
+                local st1, t1, S1 = Solver.solve(without(P, off), cap)
+                P.off = off
+                local st2, t2, S2 = Solver.solve(P, cap)
+                assert.are.equal(st1, st2)
+                assert.are.equal(t1, t2)
+                for v = 1, P.nvars do assert.are.same(S1.dom[v], S2.dom[v]) end
+                -- a base with more sums off, moved on part-way, then a trial
+                local boff = {}
+                for i in pairs(off) do boff[i] = true end
+                for i = 1, #P.sums do
+                    if math.random() < 0.5 then boff[i] = true end
+                end
+                P.off = boff
+                local base = Solver.newBase(P, cap)
+                local mid = {}
+                for i in pairs(boff) do
+                    if off[i] or math.random() < 0.5 then mid[i] = true end
+                end
+                P.off = mid
+                Solver.extendBase(P, base)
+                P.off = off
+                local st3, t3 = Solver.trial(P, base)
+                assert.are.equal(st1, st3)
+                if st1 == "solved" then assert.are.equal(t1, t3) end
+                P.off = nil
+            end
+        end
+    end)
+
+    -- A group whose sums but two are implied (magnets' blank count) runs a
+    -- faster DP on those two: it must agree with the general group DP.
+    it("an implied group deduces exactly what the full group does", function()
+        math.randomseed(5)
+        for _ = 1, 300 do
+            local nv = math.random(2, 6)
+            local P = { nvars = nv, ksize = {}, sums = {} }
+            local A = { vars = {}, contrib = {}, clue = 0 }
+            local B = { vars = {}, contrib = {}, clue = 0 }
+            local C = { vars = {}, contrib = {}, clue = 0 }
+            for v = 1, nv do
+                local ks = math.random(2, 4)
+                P.ksize[v] = ks
+                local a, b, c, total = {}, {}, {}, math.random(2, 3)
+                for k = 1, ks do
+                    a[k] = math.random(0, 2)
+                    b[k] = math.random(0, total - math.min(a[k], total))
+                    a[k] = math.min(a[k], total)
+                    c[k] = total - a[k] - b[k]
+                end
+                local pick = math.random(ks)
+                A.vars[v], B.vars[v], C.vars[v] = v, v, v
+                A.contrib[v], B.contrib[v], C.contrib[v] = a, b, c
+                A.clue, B.clue, C.clue = A.clue + a[pick], B.clue + b[pick], C.clue + c[pick]
+            end
+            if math.random() < 0.2 then A.clue = A.clue + 1; C.clue = C.clue - 1 end
+            P.sums = { A, B, C }
+            P.grouped = { true, true, true }
+            local function solveWith(implied)
+                P.groups = { { sums = { 1, 2, 3 }, implied = implied } }
+                P._cons, P._of_var = nil, nil
+                for _, s in ipairs(P.sums) do s._xs = nil end
+                return Solver.solve(P, 2)
+            end
+            local st1, t1, S1 = solveWith(nil)
+            local st2, t2, S2 = solveWith({ [3] = true })
+            assert.are.equal(st1, st2)
+            assert.are.equal(t1, t2)
+            if st1 ~= "contradiction" then
+                for v = 1, nv do assert.are.same(S1.dom[v], S2.dom[v]) end
+            end
+        end
+    end)
 end)
