@@ -24,10 +24,11 @@ one half, a − pole on the other — or a blank piece with no poles.
 - **Three difficulty levels**, graded by the reasoning needed:
   - *Easy* — every clue shown; solvable from simple bounds on each line and
     "like poles can't touch".
-  - *Medium* — a few clues hidden; needs exact counting of +, − and blanks
-    along a line together.
-  - *Hard* — many more clues hidden, still solved by line reasoning alone:
-    no level ever needs "what if" trial and error.
+  - *Medium* — a few clues hidden; once, you get stuck and need exact
+    counting of +, − and blanks along a line together.
+  - *Hard* — more clues hidden, and you need that line reasoning at least
+    twice, with simple steps in between. No level ever needs "what if" trial
+    and error.
 - **Unique solution, proven** — the generator's solver deduces every domino
   before a puzzle is shown.
 - **Live feedback** — clues grey out when met and turn white on black when

@@ -38,22 +38,34 @@ local DIR4 = { { -1, 0 }, { 1, 0 }, { 0, -1 }, { 0, 1 } }
 
 -- Per difficulty: the solver tier the puzzle must need (see solver.lua: 1 =
 -- bounds on single lines plus "no like poles side by side", 2 = exact line
--- reasoning) and how many of the 4n clues may be hidden. Tier 3 (one-step
--- trial) is never asked for: on paper it plays as guessing, so hard is harder
--- through more hidden clues instead.
--- Easy shows every clue. `max_tries` caps how many clue removals are
--- attempted, as a multiple of n: each attempt is a full solve, and at tier 3
--- an unbounded dig cost seconds on 10x10. `full_tier` only digs candidates
--- that already need the level's tier with every clue shown: digging a
--- tier-2 candidate at tier 3 mostly ended at tier 2 again, and that wasted
--- dig was the worst case (1 s on 10x10 here).
+-- reasoning) and `steps`, the window of line-reasoning steps it must need
+-- (Solver.grade: tier-2 deductions on one line each, everything else at
+-- tier 1): none on easy, exactly one on medium, at least two on hard.
+-- Medium and hard used to differ only by how many clues were hidden, and
+-- both mostly needed a single such step. Tier 3 (one-step trial) is never
+-- asked for: on paper it plays as guessing.
+-- `max_hide` is how many clues may be hidden, as a multiple of n (of the
+-- 4n); easy shows every clue. `max_tries` caps how many clue removals are
+-- attempted, as a multiple of n: each attempt is a solve. `max_digs` caps,
+-- per size, how many candidate grids are dug before the closest one to the
+-- window is kept (a measured count, so generation stays well under a
+-- second on a Kobo; the share of puzzles inside the window is in the
+-- specs). `pre` skips, before digging, a candidate whose full-clue puzzle
+-- already needs more steps than medium allows. `full_tier`, when set, only
+-- digs candidates that need the level's tier with every clue shown.
 local LEVELS = {
-    easy   = { tier = 1, neutral = 0.20, max_hide = function()  return 0 end, max_tries = 0 },
-    medium = { tier = 2, neutral = 0.20, max_hide = function(n) return math.floor(n / 2) end, max_tries = 4 },
-    hard   = { tier = 2, neutral = 0.20, max_hide = function(n) return 3 * n end, max_tries = 4 },
+    easy   = { tier = 1, neutral = 0.20, steps = { 0, 0 }, max_digs = {},
+               max_hide = 0, max_tries = 0 },
+    medium = { tier = 2, neutral = 0.20, steps = { 1, 1 }, pre = { 0, 1 },
+               max_digs = { [6] = 12, [8] = 8, [10] = 6 },
+               max_hide = 0.5, max_tries = 4 },
+    hard   = { tier = 2, neutral = 0.20, steps = { 2, math.huge },
+               max_digs = { [6] = 30, [8] = 10, [10] = 5 },
+               max_hide = 2, max_tries = 2 },
 }
 
-local MAX_ATTEMPTS = 40
+-- Candidate grids per puzzle at most (most are rejected before any dig).
+local MAX_ATTEMPTS = 160
 
 -- ---------------------------------------------------------------------------
 -- Generator
@@ -344,14 +356,19 @@ end
 -- incrementally (Solver.trial) from the clues that stay shown whatever
 -- happens next -- those never tried, or tried and kept -- with the same
 -- result as a solve from scratch.
-local function digClues(n, P, clues, cap, max_hide, max_tries, tier, on_try)
+-- `window`, optional, is the level's range of line-reasoning steps
+-- (Solver.grade). When the dug puzzle falls outside it, hidden clues are
+-- shown again one at a time, last hidden first, and the first that brings
+-- the puzzle inside the window stays shown (showing a clue never breaks
+-- uniqueness, but it does move the steps: a line's clues may be the very
+-- ones a step reasons on). Returns clues, tier, steps (nil without window).
+local function digClues(n, P, clues, cap, max_hide, max_tries, tier, on_try, window)
     local order = {}
     for kind = 1, 4 do
         for line = 1, n do order[#order + 1] = { CLUE_KINDS[kind], line } end
     end
     shuffle(order)
     local last = math.min(#order, max_tries)
-    if max_hide <= 0 or last < 1 then return clues, tier end
     -- the sums a clue switches off: its own and its line's blank count
     local sums_of = {}
     for t = 1, last do
@@ -360,11 +377,21 @@ local function digClues(n, P, clues, cap, max_hide, max_tries, tier, on_try)
         list[2] = P.blank_of[(o[1]:sub(1, 3) == "row" and "r" or "c") .. o[2]]
         sums_of[t] = list
     end
-    local hidden, hidden_off = {}, {}
-    local function offWith(from, extra)   -- hidden + order[from..last] + extra
+    -- With a bounded window (medium), digging goes on past max_hide, up to
+    -- twice that, while the puzzle is not inside the window yet.
+    local limit = (window and window[2] < math.huge) and 2 * max_hide or max_hide
+    local hidden = {}   -- indices into order
+    local fits          -- the longest prefix of `hidden` inside the window
+    -- the sums switched off by the hidden clues (but `skip`), plus
+    -- order[from..last] and order[extra]
+    local function offWith(from, extra, skip)
         local off = {}
-        for i in pairs(hidden_off) do off[i] = true end
-        for t = from, last do
+        for h, t in ipairs(hidden) do
+            if h ~= skip then
+                for _, i in ipairs(sums_of[t]) do off[i] = true end
+            end
+        end
+        for t = from or last + 1, last do
             for _, i in ipairs(sums_of[t]) do off[i] = true end
         end
         if extra then
@@ -372,32 +399,80 @@ local function digClues(n, P, clues, cap, max_hide, max_tries, tier, on_try)
         end
         return off
     end
-    P.off = offWith(1)
-    local base = Solver.newBase(P, cap)
-    for t = 1, last do
-        if #hidden >= max_hide then break end
+    if window then
+        P.off = offWith()
+        local _, s = Solver.grade(P)
+        if s >= window[1] and s <= window[2] then fits = 0 end
+    end
+    if max_hide > 0 and last >= 1 then
+        P.off = offWith(1)
+        local base = Solver.newBase(P, cap)
+        for t = 1, last do
+            if #hidden >= max_hide and (fits == #hidden or #hidden >= limit) then break end
+            if on_try then on_try() end
+            P.off = offWith(nil, t)   -- this try: the hidden clues and order[t]
+            local st, t2 = Solver.trial(P, base)
+            if st == "solved" then
+                hidden[#hidden + 1] = t
+                tier = t2
+                if window and window[2] < math.huge then
+                    -- (P.off is exactly the puzzle with these clues hidden)
+                    local _, s = Solver.grade(P)
+                    if s >= window[1] and s <= window[2] then fits = #hidden end
+                end
+            elseif t < last then
+                -- order[t] stays shown: the base gains it
+                P.off = offWith(t + 1)
+                Solver.extendBase(P, base)
+            end
+        end
+    end
+    local steps
+    if window then
         if on_try then on_try() end
-        P.off = offWith(last + 1, t)   -- this try: the hidden clues and order[t]
-        local st, t2 = Solver.trial(P, base)
-        if st == "solved" then
-            hidden[#hidden + 1] = order[t]
-            for _, i in ipairs(sums_of[t]) do hidden_off[i] = true end
-            tier = t2
-        elseif t < last then
-            -- order[t] stays shown: the base gains it
-            P.off = offWith(t + 1)
-            Solver.extendBase(P, base)
+        P.off = offWith()
+        local _
+        _, steps = Solver.grade(P)
+        if (steps < window[1] or steps > window[2]) and fits then
+            for h = #hidden, fits + 1, -1 do hidden[h] = nil end
+            P.off = offWith()
+            _, steps, tier = Solver.grade(P)
+        end
+        if steps < window[1] or steps > window[2] then
+            for h = #hidden, 1, -1 do
+                if on_try then on_try() end
+                P.off = offWith(nil, nil, h)
+                local st, s, t2 = Solver.grade(P)
+                if st == "solved" and s >= window[1] and s <= window[2] then
+                    table.remove(hidden, h)
+                    steps, tier = s, t2
+                    break
+                end
+            end
         end
     end
     P.off = nil
     local out = copyClues(clues)
-    for _, o in ipairs(hidden) do out[o[1]][o[2]] = false end
-    return out, tier
+    for _, t in ipairs(hidden) do
+        local o = order[t]
+        out[o[1]][o[2]] = false
+    end
+    return out, tier, steps
+end
+
+-- How far a dug puzzle is from its level: 0 when it needs the level's tier
+-- and a number of line-reasoning steps (Solver.grade) inside the level's
+-- window; otherwise the gap, a wrong tier counting most.
+local function missBy(lv, tier, steps)
+    local miss = (lv.tier - tier) * 100
+    if steps < lv.steps[1] then miss = miss + lv.steps[1] - steps end
+    if steps > lv.steps[2] then miss = miss + steps - lv.steps[2] end
+    return miss
 end
 
 -- One complete puzzle. The solver must deduce every domino (which proves the
--- solution unique); the first candidate whose hardest step equals the level's
--- tier wins, otherwise the hardest seen is kept.
+-- solution unique); the first candidate that needs the level's tier and
+-- number of line-reasoning steps wins, otherwise the closest seen is kept.
 -- `on_progress(fraction)`, optional, is called before every solve. The work
 -- has no fixed size (a level may take one candidate or many), so the
 -- fraction approaches 1 as solves pile up, against the typical count of one
@@ -405,12 +480,12 @@ end
 local function generatePuzzle(n, difficulty, on_progress)
     local lv = LEVELS[difficulty] or LEVELS[DEFAULT_DIFF]
     local max_tries = math.floor(lv.max_tries * n)
-    local solves, typical = 0, 1 + max_tries
+    local solves, typical = 0, 2 + max_tries
     local function tick()
         solves = solves + 1
         if on_progress then on_progress(solves / (solves + typical)) end
     end
-    local best
+    local best, digs = nil, 0
     for _ = 1, MAX_ATTEMPTS do
         local dom_id, dominoes = makeTiling(n)
         local pairs_ = buildPairs(n, dom_id, dominoes)
@@ -420,12 +495,24 @@ local function generatePuzzle(n, difficulty, on_progress)
         P.pairs      = pairs_
         tick()
         local st, tier = Solver.solve(P, lv.tier)
+        if st == "solved" and tier == 2 and lv.pre then
+            local _, s0 = Solver.grade(P)
+            if s0 < lv.pre[1] or s0 > lv.pre[2] then st = "pre" end
+        end
         if st == "solved" and (tier == lv.tier or not lv.full_tier) then
-            clues, tier = digClues(n, P, clues, lv.tier, lv.max_hide(n), max_tries, tier, tick)
-            if not best or tier > best.tier then
-                best = { dom_id = dom_id, dominoes = dominoes, solution = sol, clues = clues, tier = tier }
+            local steps
+            clues, tier, steps = digClues(n, P, clues, lv.tier, math.floor(lv.max_hide * n),
+                                          max_tries, tier, tick, lv.steps)
+            local miss = missBy(lv, tier, steps)
+            if not best or miss < best.miss then
+                best = { dom_id = dom_id, dominoes = dominoes, solution = sol, clues = clues,
+                         tier = tier, miss = miss }
             end
-            if tier == lv.tier then break end
+            digs = digs + 1
+            if miss == 0 then break end
+            -- past the cap, the closest puzzle is kept, but never one
+            -- easier than the level's tier
+            if digs >= (lv.max_digs[n] or MAX_ATTEMPTS) and best.tier == lv.tier then break end
         end
     end
     return best
@@ -456,7 +543,7 @@ function MagnetsBoard:generate(n, difficulty, on_progress)
     self.n          = n or self.n
     self.difficulty = difficulty or self.difficulty
     -- No puzzle can come back nil: every attempt with all clues shown is at
-    -- worst "stuck", and 40 stuck attempts in a row have not been observed;
+    -- worst "stuck", and 160 stuck attempts in a row have not been observed;
     -- loop anyway rather than hand the screen a nil.
     local p
     repeat p = generatePuzzle(self.n, self.difficulty, on_progress) until p
