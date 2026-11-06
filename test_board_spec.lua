@@ -104,16 +104,39 @@ describe("MagnetsBoard", function()
         end)
 
         -- Trial reasoning (tier 3) plays as guessing on paper: no level may
-        -- need it. Hard is harder through more hidden clues instead.
-        it("medium and hard hide clues, need line reasoning but never trial", function()
-            for seed = 1, 6 do
-                local m = newBoard(8, "medium", seed)
-                assert.are.equal(2, m.tier)
-                assert.is_true(m:hiddenCount() > 0)
-                assert.are.equal("stuck", (Solver.solve(m:getProblem(), 1)))
-                local h = newBoard(8, "hard", seed)
-                assert.are.equal("solved", (Solver.solve(h:getProblem(), 2)))
-                assert.is_true(h:hiddenCount() > m:hiddenCount())
+        -- need it. The levels differ by how many line-reasoning steps
+        -- (Solver.grade) they need: none on easy, one on medium, at least
+        -- two on hard. A level keeps the closest puzzle when its search cap
+        -- runs out, so the windows are checked as shares (1.3.0, over 40
+        -- seeds per size: medium 95-100 %, hard 87-97 %), and the averages
+        -- of steps and hidden clues must rise from level to level.
+        it("levels need 0 / 1 / 2+ line-reasoning steps, never trial", function()
+            local seeds = 8
+            for _, n in ipairs(Board.SIZES) do
+                local prev_steps, prev_hidden = -1, -1
+                for _, diff in ipairs({ "easy", "medium", "hard" }) do
+                    local lv = Board.LEVELS[diff]
+                    local inside, steps_sum, hidden_sum = 0, 0, 0
+                    for seed = 1, seeds do
+                        local b = newBoard(n, diff, seed * 13 + n)
+                        local P = b:getProblem()
+                        assert.are.equal("solved", (Solver.solve(P, 2)))
+                        local st, steps, tier = Solver.grade(P)
+                        assert.are.equal("solved", st)
+                        assert.are.equal(lv.tier, tier)
+                        if steps >= lv.steps[1] and steps <= lv.steps[2] then inside = inside + 1 end
+                        steps_sum, hidden_sum = steps_sum + steps, hidden_sum + b:hiddenCount()
+                    end
+                    if diff == "easy" then
+                        assert.are.equal(seeds, inside)
+                        assert.are.equal(0, hidden_sum)
+                    else
+                        assert.is_true(inside >= seeds - 2, n .. " " .. diff .. ": " .. inside)
+                    end
+                    assert.is_true(steps_sum / seeds > prev_steps, n .. " " .. diff)
+                    assert.is_true(hidden_sum / seeds > prev_hidden, n .. " " .. diff)
+                    prev_steps, prev_hidden = steps_sum / seeds, hidden_sum / seeds
+                end
             end
         end)
 
@@ -148,18 +171,19 @@ describe("MagnetsBoard", function()
             end
         end)
 
-        -- 1.2.0 made generation faster without changing what a seed gives:
-        -- these are 1.1.0's clues (math.random differs between LuaJIT and
-        -- PUC Lua, hence two sets).
-        it("gives the same puzzles per seed as 1.1.0", function()
+        -- What a seed gives (the Daily Challenge relies on it). 1.3.0
+        -- changed it once, when levels started to be graded by line-reasoning
+        -- steps (math.random differs between LuaJIT and PUC Lua, hence two
+        -- sets).
+        it("gives the same puzzles per seed as 1.3.0", function()
             local expected = jit and {
-                "2.22.2 3.3.2. 232.3. ..12..",
+                "2.22.2 3.3322 232.3. ..12.3",
                 "3434.22. 43432.32 3443133. 34422243",
-                "3..4.4...5 .....4.535 5..45434.5 .455...4.5",
+                "3..4.45.45 ..5..4.535 55445434.5 .455...4.5",
             } or {
-                ".1.... .3...1 .....1 33221.",
-                "3332.424 4223423. 44212.43 4.213333",
-                "4.3534.... ..534.344. 5..13..4.. 555.14.44.",
+                ".1.... .3...1 3..2.1 332211",
+                "3332.424 4223423. 44212.43 44213333",
+                "4535343..4 ..534.344. 55.13..4.4 555.14.44.",
             }
             local function key(b)
                 local out = {}

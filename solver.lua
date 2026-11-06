@@ -914,6 +914,65 @@ function Solver.solve(P, cap, S)
     end
 end
 
+-- Grading as a player solves: tier 1 to a fixpoint, then ONE line of
+-- tier-2 reasoning (the first tier-2 unit, in a fixed order, that removes
+-- an option), then tier 1 again, and so on. It makes the same eliminations
+-- as Solver.solve(P, 2), so it reaches the same status; what it adds is the
+-- effort, `steps`: how many lines the player has to reason on exactly
+-- because tier 1 alone is stuck (0 = tier 1 is enough).
+-- Returns status, steps, tier (1 or 2).
+local function step2(P, S)
+    stamped(S, P.nvars)
+    local grouped, off = P.grouped or {}, P.off
+    local alone = {}
+    for _, g in ipairs(P.groups or {}) do
+        local active = true
+        if off then
+            for _, i in ipairs(g.sums) do
+                if off[i] then active = false; break end
+            end
+        end
+        if active then
+            if g.implied then prepareGroup2(g, P) else prepareGroup(g, P) end
+            if moved(S, g, g.vars) then
+                local ok, ch
+                if g.implied then ok, ch = exactGroup2(g, P, S) else ok, ch = exactGroup(g, P, S) end
+                if not ok then return false, true end
+                S.ran[g] = S.tick
+                if ch then return true, true end
+            end
+        else
+            for _, i in ipairs(g.sums) do alone[i] = true end
+        end
+    end
+    for i = 1, #P.sums do
+        if not (off and off[i]) and (not grouped[i] or alone[i]) then
+            local s = P.sums[i]
+            if moved(S, s, s.vars) then
+                local ok, ch = exactSum(s, S)
+                if not ok then return false, true end
+                S.ran[s] = S.tick
+                if ch then return true, true end
+            end
+        end
+    end
+    return true, false
+end
+if jit then jit.off(step2) end
+
+function Solver.grade(P)
+    local S, steps = fullState(P), 0
+    while true do
+        local tier = steps > 0 and 2 or 1
+        if not fix1(P, S) then return "contradiction", steps, tier end
+        if isSolved(P, S) then return "solved", steps, tier end
+        local ok, ch = step2(P, S)
+        if not ok then return "contradiction", steps, 2 end
+        if not ch then return "stuck", steps, tier end
+        steps = steps + 1
+    end
+end
+
 -- Incremental solving, for a caller that solves many variants of one
 -- problem: the generators' dig, which hides clues one at a time (the same
 -- sums with some switched off, P.off). Every propagator only ever removes

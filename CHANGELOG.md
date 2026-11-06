@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.3.0] - 2026-11-06
+
+### Changed
+- Medium and Hard really differ now. Both used to need about the same
+  reasoning: a single step of exact line counting (+, − and blanks along
+  a line together) unlocked the rest; Hard only hid more clues. The
+  generator now counts those line-reasoning steps as a player takes them,
+  one line at a time with the simple deductions in between: Easy needs
+  none, Medium exactly one, Hard at least two. Measured over 40 puzzles
+  per size: Medium 1.0 steps on average (before: 1.2 to 1.7), Hard 2.0 to
+  2.3 (before: 1.3 to 1.7). Medium hides about 4 clues, Hard about 9 to 12
+  (before: 12 to 18; the extra steps make it harder than hiding more did).
+  No level needs trial and error.
+- Generation takes a little longer on Medium and Hard (up to about 0.05 s
+  on a desktop, 1 to 1.5 s on a Kobo; a progress bar shows meanwhile).
+- The same seed gives a different puzzle than in 1.2.1, so the Daily
+  Challenge puzzle changes once.
+
 ## [1.2.1] - 2026-11-04
 
 ### Fixed

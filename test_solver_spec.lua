@@ -259,6 +259,47 @@ describe("Solver", function()
         end
     end)
 
+    -- Solver.grade (1.3.0) takes tier-2 steps one line at a time: it must
+    -- reach the same status and tier as Solver.solve(P, 2), and need a
+    -- line-reasoning step exactly when tier 1 alone is stuck.
+    it("grade agrees with solve and counts a step only past tier 1", function()
+        math.randomseed(23)
+        local seen = {}
+        for _ = 1, 400 do
+            local nv = math.random(3, 7)
+            local P = { nvars = nv, ksize = {}, sums = {}, pairs = {} }
+            for v = 1, nv do P.ksize[v] = math.random(2, 4) end
+            local sol = {}
+            for v = 1, nv do sol[v] = math.random(P.ksize[v]) end
+            for _ = 1, math.random(2, 6) do
+                local sm = { vars = {}, contrib = {}, clue = 0 }
+                for v = 1, nv do
+                    if math.random() < 0.6 then
+                        local c = {}
+                        for k = 1, P.ksize[v] do c[k] = math.random(0, 2) end
+                        sm.vars[#sm.vars + 1], sm.contrib[#sm.contrib + 1] = v, c
+                        sm.clue = sm.clue + c[sol[v]]
+                    end
+                end
+                if #sm.vars > 0 then P.sums[#P.sums + 1] = sm end
+            end
+            if #P.sums >= 2 and math.random() < 0.5 then
+                P.groups, P.grouped = { { sums = { 1, 2 } } }, { true, true }
+            end
+            if math.random() < 0.3 then P.off = { [math.random(#P.sums)] = true } end
+            local st, tier = Solver.solve(P, 2)
+            local gst, steps, gtier = Solver.grade(P)
+            local st1 = Solver.solve(P, 1)
+            assert.are.equal(st, gst)
+            if st == "solved" then
+                assert.are.equal(tier, gtier)
+                assert.are.equal(st1 == "solved", steps == 0)
+                seen[steps > 0 and "steps" or "none"] = true
+            end
+        end
+        assert.is_true(seen.steps and seen.none)
+    end)
+
     -- A group whose sums but two are implied (magnets' blank count) runs a
     -- faster DP on those two: it must agree with the general group DP.
     it("an implied group deduces exactly what the full group does", function()
